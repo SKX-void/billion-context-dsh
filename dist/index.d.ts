@@ -46,7 +46,7 @@ export { buildNudge, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN, type Nudge
 export { DEFAULT_CONTEXT_WINDOW, detectContextWindow, projectedContextWindow, windowSourceLabel, type AcpWindow, } from './window.ts';
 export { AlreadyCompressedRangeError, rebuildBlockLedger, resolveSurfaceRange, runCompactionTransaction, shadowedSeqsOf, findOpenTurn, assertNoActiveCompaction, blockRegistry, blockRefForSummarySeq, compactionIdsOfKernelBlocks, summarySeqOfKernelBlock, expandShadowedSeqs, hideCompressToolPair, stripOrphanedSurfaceToolMessages, type AcpBlockLedgerEntry, type CompactionTransactionInput, type ResolvedSurfaceRange, } from './region.ts';
 export { eventsToCoreMessages, projectEvent, surfaceEventsOf, extractEventText } from './messages.ts';
-export { ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, describeSettingsChange, filterSettingsEntry, makeSettingsCommandSurface, parseSettingValue, resolveAcpSettings, SETTINGS_KEYS, SETTING_DEFAULTS, type AcpSettings, type AcpSettingsInput, type SettingsChangeEffect, type SettingsCommandSurface, type SettingsKey, } from './settings.ts';
+export { ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, describeSettingsChange, filterSettingsEntry, makeSettingsCommandSurface, parseSettingValue, readSettingsInput, resolveAcpSettings, SETTINGS_KEYS, SETTING_DEFAULTS, withoutSettingsKeys, type AcpSettings, type AcpSettingsInput, type SettingsChangeEffect, type SettingsCommandSurface, type SettingsKey, } from './settings.ts';
 export interface AcpConfig {
     /**
      * The context window used for pressure decisions, in tokens. When omitted,
@@ -141,6 +141,29 @@ export declare function resolveAcpConfig(config?: Partial<AcpConfig>): AcpConfig
  * model-driven block compression without touching the agent loop.
  */
 export declare class AcpCompactionEngine extends CompactionEngine {
+    /**
+     * The cordis Config schema — the host's settings form for this plugin.
+     * dsh-settings >= 0.2.0 projects a form per loader entry from its exported
+     * `Config` and only accepts runtime edits on `.volatile()` fields, so the
+     * six scalar knobs live here (see `src/settings.ts`). Unknown keys on a
+     * composition row (prompts, coreOverrides, countTokens, preset, …) are
+     * preserved untouched by schemastery object resolution.
+     */
+    static Config: import("@deepseek-ai/schemastery").default<Schemastery.ObjectS<NoInfer<{
+        modelContextLimit: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        autoModelContextLimit: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile">;
+        nudgeMinContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        nudgeMaxContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        nudgeEmergencyThresholdPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        autoNudge: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile">;
+    }>>, Schemastery.ObjectT<NoInfer<{
+        modelContextLimit: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        autoModelContextLimit: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile">;
+        nudgeMinContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        nudgeMaxContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        nudgeEmergencyThresholdPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        autoNudge: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile">;
+    }>>, "plain">;
     /** The framework-agnostic ACP compression core, reused verbatim. */
     readonly kernel: CompressionCore;
     /** Per-session kernel state. */
@@ -164,10 +187,14 @@ export declare class AcpCompactionEngine extends CompactionEngine {
     private readonly compressCallIdsToHide;
     /** Per provider/model route the resolved window (probe failures cached too). */
     private readonly windowCache;
-    /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (SettingsProvider.installSection). */
+    /** Live settings snapshot thunk — reads the volatile config fields, so a settings-form edit is visible on the next read. */
     private readSettingsSource;
+    /** The last snapshot the diff handler saw, so a live edit can be noticed at pre-step (SettingsForms has no change callback). */
+    private currentSettings;
     /** The settings service, captured lazily for /acp-prune config (undefined in provider-less processes). */
     private settingsService;
+    /** This plugin's profile entry id — the key the host files its settings form under (falls back to the composition row id). */
+    private settingsEntryId;
     /** /acp-prune config read/write surface. */
     readonly settingsCommand: SettingsCommandSurface;
     /** Per route the adapter's per-request output cap (the output reservation); null = undisclosed. */
@@ -206,6 +233,14 @@ export declare class AcpCompactionEngine extends CompactionEngine {
      * edited settings.yaml, and an invalid stored section would fail the next
      * boot loud anyway).
      */
+    /**
+     * Land a live settings change: re-read the snapshot and run the diff handler
+     * when it moved. dsh-settings >= 0.2.0 has no change callback (the 0.1.5
+     * seam's `onChange` is gone), so the diff runs at the first `agent/pre-step`
+     * of every step — the same place every consumer reads the live values from,
+     * which is why a form edit cannot reach reads while the caches stay stale.
+     */
+    private syncSettings;
     private onSettingsChanged;
     /**
      * The adapter's per-request output cap for a route, from one

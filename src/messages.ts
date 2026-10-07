@@ -21,7 +21,7 @@ import { eventAtOf, sessionEventsOf } from './session-events.ts'
 // MessageSourceMap predates V4 admission, so register this plugin's two
 // producer kinds on its documented merge-extensibility seam ("plugins add
 // their own kinds"). Type-level only — no runtime effect.
-declare module '@deepseek-ai/dsh-llm/message' {
+declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     acpNudge: { kind: 'plugin:acp-nudge' }
     acpPrune: { kind: 'plugin:billion-context-dsh' }
@@ -140,7 +140,7 @@ function stringifyArgs(args: unknown): string {
 export function toolCallIdOfResultEvent(event: SessionEvent): string | null {
   if (event.type !== 'tool/result') return null
   const message = (event.data as {
-    message?: { content?: Array<{ type?: unknown; toolCallId?: unknown }>; source?: { callId?: unknown } }
+    message?: { content?: ReadonlyArray<{ type?: unknown; toolCallId?: unknown }>; source?: { callId?: unknown } }
   }).message
   const block = Array.isArray(message?.content)
     ? message.content.find((candidate) => candidate?.type === 'tool-result')

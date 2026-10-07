@@ -12,6 +12,33 @@
 > **评审状态**：已经过三路独立评审（宿主接缝合规 / 引擎架构与回归风险 / 对抗性边界），
 > 全部阻断项已修复，判定均为「修改后通过」。v2 修订明细见文末修订记录。
 
+> **0.2.0 端口更新（2026-09-28，AGENTS.md rule 17 / rule 20）**：本文档 §1 起记录的是 **0.1.x 线**的
+> `SettingsProvider.installSection` 接缝（含 `settingsNamespace()` 与「注册 filtered base」的取舍），
+> **该接缝在 0.2.0 线已被整体删除**，现行实现按 `SettingsForms` 重写：
+>
+> - 六个可调键**就是**插件自身的 `static Config = AcpSettingsSchema`——单一事实来源，不再有「向接缝注册
+>   base 层」这一步：宿主从每个 loader 条目的导出 `Config` schema **自行投影**一张表单（`describe()` 跳过
+>   没有导出 Config schema 的条目）。
+> - 每个字段必须 `.volatile()`（否则 `update()` 抛 `Plugin entry "…" has no volatile fields`），且**不得
+>   声明 `.default()`**：schemastery 会**急切**施加默认值，一旦带默认就会再次掩盖 `config.preset`
+>   （issue #176 的陷阱）；引擎默认值留在 `SETTING_DEFAULTS`，由 `resolveAcpConfig` 在**读取期**施加。
+> - 读路径：`readSettingsInput()` 解 `Volatile.get()` 并**省略缺失键**（写成 `undefined` 会抹掉默认值），
+>   `withoutSettingsKeys()` 剥离六键后再 `resolveAcpConfig`。活值就是 loader **原地**提交的同一份引用
+>   （`Entry.update` → `equalExceptVolatile` → `updateVolatile(ref, source)`，**不重挂载**）。
+> - 写路径：按 **profile 条目 id**（`ctx.fiber.entry.options.id`，结构性读取 + `ACP_SETTINGS_NAMESPACE` 兜底）
+>   走 `update(entryId, patch)` / `replace(entryId, section)`；引擎从 `describe()` 里按 `ns` 认领**自己**那行。
+> - 变更检测：接缝**没有** onChange 回调，`syncSettings()` 在每步首个 `agent/pre-step` 做六值 diff（相等即短路），
+>   变更时施加 `describeSettingsChange` 的窗口缓存 / nudge 去重效果，并 try/catch 保证设置失败不影响本轮。
+> - 组合契约：宿主写入前会 `strip(raw, form)` **只剔除 volatile 路径**再 merge，所以行内
+>   `prompts`/`coreOverrides`/`countTokens`/`preset` 永不被设置层改写（旧版「注册 filtered base 防污染」的顾虑
+>   在新接缝下由宿主侧结构性保证）；而 `replace()` 以 **base 为底**合并，故单键 reset 必须把
+>   `describe().user` 的其余键原样带回，否则会静默回退操作者的其它运行时覆盖。
+> - `ctx.inject(['settings'], …)` 必须返回 disposer（清空服务句柄），否则服务卸载后 `/acp-prune config` 仍报
+>   `available: true` 却写进死句柄；`settingsEnabled: false` 仍是组合行专用开关（开关不能关掉自己）。
+>
+> 回归钉：`tests/settings.test.ts`；验证结果见
+> [docs/dsh-porting-verification.md](dsh-porting-verification.md) 的「DSH 0.2.0-rc.2 端口记录」。
+
 ---
 
 ## 1. 背景与动机

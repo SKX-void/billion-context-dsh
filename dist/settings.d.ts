@@ -1,14 +1,16 @@
 /**
  * M6 — runtime settings integration. Wires the engine's scalar knobs into the
- * host's user-settings layer (`~/.dsh/settings.yaml`, section
- * `compaction-acp`) through the official consumer seam
- * `SettingsProvider.installSection` (@deepseek-ai/dsh-settings), so editing the file
- * applies to RUNNING sessions without a restart.
+ * host's settings form through the dsh-settings >= 0.2.0 seam
+ * (`SettingsForms`), which projects one form per loader entry from that
+ * entry's Config schema and requires its fields to be volatile. Editing the
+ * form re-resolves the entry config in place, so a change applies to RUNNING
+ * sessions without a restart.
  *
- * Layering (per key): schemastery schema default → composition-row subset
- * (the `base` layer, filtered by `filterSettingsEntry`) → user section.
- * The `/acp-prune config` slash command reads and writes the same namespace
- * through the `SettingsCommandSurface` built here.
+ * Layering (per key): engine default, then the inherited composition layer
+ * (`base`), then the profile patch override (`user`); both layers are read
+ * back from the host's `describe()` for this plugin's own entry id, so the
+ * engine keeps no second store. The `/acp-prune config` slash command reads
+ * and writes that form through the `SettingsCommandSurface` built here.
  *
  * Deliberately NOT exposed through settings: `coreOverrides`, `countTokens`,
  * `autoTools`, `autoCommand`, `prompts` (object/function values or
@@ -18,13 +20,12 @@
  * @module billion-context-dsh/settings
  */
 import z from '@deepseek-ai/schemastery';
-import type { SettingsDescriptor, SettingsProvider } from '@deepseek-ai/dsh-settings';
+import type { SettingsDescriptor, SettingsForms } from '@deepseek-ai/dsh-settings';
 /**
- * The host settings namespace — same id as the bundle/composition row, so "the
- * settings.yaml section" and "the cordis.patch.yml row" are one mental object.
- * A plain string literal as of the 0.1.5 line: the seam's `settingsNamespace()`
- * runtime helper is gone and the brand is applied at the call site instead
- * (`installSection`'s `Namespace & SettingsNamespaceInput<Namespace>`).
+ * The settings entry id: the composition row id in cordis.patch.yml, which is
+ * also the key the host files this plugin settings form under. Used as the
+ * FALLBACK when the engine is built outside the loader (unit tests,
+ * programmatic mounts), where no profile entry exists.
  */
 export declare const ACP_SETTINGS_NAMESPACE = "compaction-acp";
 /** The six knobs exposed to the runtime settings layer. Order defines /acp-prune config listing order. */
@@ -79,26 +80,43 @@ export declare function filterSettingsEntry(entry: AcpSettingsCompositionEntry):
 /** Apply the engine defaults to a (possibly partial) settings input. */
 export declare function resolveAcpSettings(input: AcpSettingsInput): AcpSettings;
 /**
- * The settings schema. Defaults here are the ENGINE defaults (0.70/0.85),
- * not the kernel's 0.75/0.95 — an untouched namespace must reproduce exactly
- * today's behavior. Integer constraint uses `.step(1).min(1)` because
+ * The plugin's cordis Config schema, and therefore the host settings form:
+ * dsh-settings >= 0.2.0 (`SettingsForms`) projects one form per loader entry
+ * from the entry's exported `Config`, and it refuses a runtime edit unless the
+ * field is `.volatile()` ("Plugin entry ... has no volatile fields"). Editing
+ * the form re-resolves the entry config in place, so every reader below sees
+ * the new value without a restart.
+ *
+ * NO `.default()` on any field, deliberately: the schema resolver applies
+ * defaults EAGERLY, so a defaulted `nudge*Pct` would be indistinguishable from
+ * an explicit row value and would mask `config.preset` (issue #176). Engine
+ * defaults live in `SETTING_DEFAULTS` / `resolveAcpSettings` and are applied at
+ * READ time instead. Integer constraint uses `.step(1).min(1)` because
  * schemastery 3.18.x has no `.int()`/`.positive()` helpers.
  */
-export declare const AcpSettingsSchema: z<Schemastery.ObjectS<{
-    modelContextLimit: z<number, number>;
-    autoModelContextLimit: z<boolean, boolean>;
-    nudgeMinContextLimitPct: z<number, number>;
-    nudgeMaxContextLimitPct: z<number, number>;
-    nudgeEmergencyThresholdPct: z<number, number>;
-    autoNudge: z<boolean, boolean>;
-}>, Schemastery.ObjectT<{
-    modelContextLimit: z<number, number>;
-    autoModelContextLimit: z<boolean, boolean>;
-    nudgeMinContextLimitPct: z<number, number>;
-    nudgeMaxContextLimitPct: z<number, number>;
-    nudgeEmergencyThresholdPct: z<number, number>;
-    autoNudge: z<boolean, boolean>;
-}>>;
+export declare const AcpSettingsSchema: z<Schemastery.ObjectS<NoInfer<{
+    modelContextLimit: z<number, number, "volatile">;
+    autoModelContextLimit: z<boolean, boolean, "volatile">;
+    nudgeMinContextLimitPct: z<number, number, "volatile">;
+    nudgeMaxContextLimitPct: z<number, number, "volatile">;
+    nudgeEmergencyThresholdPct: z<number, number, "volatile">;
+    autoNudge: z<boolean, boolean, "volatile">;
+}>>, Schemastery.ObjectT<NoInfer<{
+    modelContextLimit: z<number, number, "volatile">;
+    autoModelContextLimit: z<boolean, boolean, "volatile">;
+    nudgeMinContextLimitPct: z<number, number, "volatile">;
+    nudgeMaxContextLimitPct: z<number, number, "volatile">;
+    nudgeEmergencyThresholdPct: z<number, number, "volatile">;
+    autoNudge: z<boolean, boolean, "volatile">;
+}>>, "plain">;
+export declare function readSettingsInput(config: AcpSettingsInput): AcpSettingsInput;
+/**
+ * A resolved config with the six settings keys REMOVED. Their values must never
+ * reach `resolveAcpConfig` in wrapper form (a `Volatile` object spread over
+ * `DEFAULT_CONFIG` would become the configured value); `readSettingsInput`
+ * supplies the plain values instead.
+ */
+export declare function withoutSettingsKeys<T extends object>(config: T): Omit<T, SettingsKey>;
 /** What changed between two settings snapshots, and what the engine must do about it. */
 export interface SettingsChangeEffect {
     /**
@@ -153,5 +171,9 @@ export interface SettingsCommandSurface {
  * engine captures the service through a parallel `ctx.inject(['settings'])`,
  * so the reference may legitimately be undefined for the whole process life
  * (headless/plain compositions have no settings provider).
+ *
+ * `getEntryId` answers this plugin's profile entry id — dsh-settings >= 0.2.0
+ * files forms and writes BY ENTRY ID (`update(ns, patch)`), not by a namespace
+ * the plugin registers for itself.
  */
-export declare function makeSettingsCommandSurface(getService: () => SettingsProvider | undefined, getSnapshot: () => AcpSettings): SettingsCommandSurface;
+export declare function makeSettingsCommandSurface(getService: () => SettingsForms | undefined, getSnapshot: () => AcpSettings, getEntryId: () => string): SettingsCommandSurface;

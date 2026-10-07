@@ -12,7 +12,7 @@
  */
 import type { CoreMessage } from 'acp-kernel';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
-declare module '@deepseek-ai/dsh-llm/message' {
+declare module '@deepseek-ai/dsh-llm' {
     interface MessageSourceMap {
         acpNudge: {
             kind: 'plugin:acp-nudge';

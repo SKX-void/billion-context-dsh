@@ -71,23 +71,36 @@ Restart `dsh` afterwards (bundle layers are composed at startup), open a new ses
 > **DSH version compatibility.** The package declares all five runtime seam
 > packages (`dsh-compaction` / `dsh-session` / `dsh-llm` / `dsh-tools` /
 > `dsh-settings`) as peer
-> dependencies, sharing the range `>=0.1.5-alpha.1 <0.1.6-0` — exactly the
-> `0.1.5` line (every prerelease plus the final `0.1.5`). From the `0.1.5` line
-> on, the session's replace operation was renamed from `{ op, start, end }` to
-> `{ op, startSeq, endSeq }` and is validated strictly (exactly those three
-> keys), so the engine emits the new shape only: on older DSH hosts (< 0.1.5)
-> every `compress` call is rejected at runtime (issue #136), which is why the
-> old lines are out of contract — upgrade DSH before installing this release.
-> The explicit bounds (instead of a caret) are deliberate: a caret would
-> silently admit the unverified 0.1.6+ line. Declaring all five seam packages
+> dependencies, sharing the range `>=0.2.0-rc.2 <0.2.1-0` — the whole `0.2.0`
+> line, from the verified `0.2.0-rc.2` up to (and including) the final `0.2.0`.
+> The `0.2.0` line broke three seams the engine touches, so this release was
+> ported to the new seams and supports the `0.2.0` line ONLY: (a) `dsh-settings`
+> dropped `SettingsProvider.installSection` for `SettingsForms`
+> (`describe` / `update` / `replace` / `mutate`), which projects one form per
+> **profile entry id** from the entry's exported `Config` schema — the six
+> editable keys are now the plugin's own `static Config` and must be
+> `.volatile()` to be writable at runtime; (b) `dsh-llm` moved its
+> module-augmentation target from `@deepseek-ai/dsh-llm/message` to the package
+> root, and `ContentBlock` no longer carries a top-level `toolCallId` (tool
+> result ids all go through the shared `toolCallIdOfResultEvent` extractor);
+> (c) `dsh-llm-deepseek` split out `dsh-llm-deepseek-api-key` (provider
+> registration + API-key resolution) and speaks Anthropic-Messages SSE. Older
+> DSH lines (`0.1.x`) are out of contract — upgrade DSH before installing this
+> release. The explicit bounds (instead of a caret) are deliberate: a caret
+> would silently admit the unverified `0.2.1+` line (`0.2.0-rc.1` is the same
+> line but unverified, and is excluded too). Declaring all five seam packages
 > as peers (not just `dsh-compaction`) ensures that, even under pnpm's
 > hoisted/linked layout, installations resolve them to the **host's own** copy
 > rather than a stale nested copy inconsistent with the host.
 >
-> Behavior note (from 0.1.5 on): the host no longer permits invisible
-> replacement nodes, so when the engine cleans up orphaned tool messages it
-> leaves one short visible placeholder message in their place; the host-owned
-> system prompt node (surface node 0) is excluded from compressible ranges.
+> Behavior note: the host no longer permits invisible replacement nodes, so
+> when the engine cleans up orphaned tool messages it leaves one short visible
+> placeholder message in their place; the host-owned system prompt node
+> (surface node 0) is excluded from compressible ranges; and `agent/pre-step`
+> runs BEFORE the claimed inbox messages land in the session, so the pressure
+> the nudge reads is the previous turn's occupancy (thresholds are crossed one
+> turn later than on the `0.1.5` host; the value itself still comes from
+> `contextPressure.projectedTokens`, the same caliber the UI shows).
 
 **Path B: plain `npm install` (package only — a composition row is required).**
 
@@ -167,7 +180,7 @@ compaction-acp:
 /acp-prune config reset all
 ```
 
-Changing a window key (`modelContextLimit` / `autoModelContextLimit`) clears the window-probe cache — the next pre-step re-probes under the new values (probe failures are cached too, so this is also how a fixed gateway gets re-probed). In provider-less plain-npm compositions `/acp-prune config` degrades to advice text; on DSH lines ≥0.1.7, where the host settings service no longer provides `installSection` (outside this plugin's declared peer range), the engine degrades cleanly too — one startup warning, the six keys stay adjustable through the composition-row `config:`, engine and tools unaffected (issue #173); `settingsEnabled: false` disables the integration entirely (composition-row-only — the switch is deliberately NOT part of the settings layer: it cannot turn itself off). Design details: [docs/settings-integration-design.md](docs/settings-integration-design.md).
+Changing a window key (`modelContextLimit` / `autoModelContextLimit`) clears the window-probe cache — the next pre-step re-probes under the new values (probe failures are cached too, so this is also how a fixed gateway gets re-probed). In provider-less plain-npm compositions `/acp-prune config` degrades to advice text. The `0.2.0` seam is `SettingsForms`: the six keys ARE the plugin's own `static Config` (all `.volatile()`, deliberately **without schema defaults** — the engine applies its defaults at read time), the host projects one form per profile entry id, and `/acp-prune config set/reset` go through `update` / `replace(entryId)`; the loader commits a runtime edit in place (same volatile references, **no remount**) and the engine hot-applies it from a six-value diff at each step's `agent/pre-step`; `settingsEnabled: false` disables the integration entirely (composition-row-only — the switch is deliberately NOT part of the settings layer: it cannot turn itself off). Design details: [docs/settings-integration-design.md](docs/settings-integration-design.md).
 
 **Per-mode — an agent preset's `compaction` realm.** First *disable (or delete) the realm's existing `dsh-compaction-basic` row*, then mount this engine — two backends cannot coexist in the same realm:
 

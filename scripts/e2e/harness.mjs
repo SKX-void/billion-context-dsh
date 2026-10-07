@@ -53,13 +53,16 @@ const runScenario = async (scenario) => {
   const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
   const AgentLoop = (await import('@deepseek-ai/dsh-agent-loop')).default
   const { mountAgentLoopTestDependencies } = await import('@deepseek-ai/dsh-agent-loop-testkit')
-  const LlmDeepSeek = await import('@deepseek-ai/dsh-llm-deepseek')
+  // 0.2.0 split the provider: `@deepseek-ai/dsh-llm-deepseek` is now the
+  // protocol library (no `apply` export), and the plugin that registers the
+  // `deepseek-official` route with API-key auth is `...-api-key`.
+  const LlmDeepSeekApiKey = await import('@deepseek-ai/dsh-llm-deepseek-api-key')
   const TokenMeter = (await import('@deepseek-ai/dsh-token-meter')).default
   const AcpEngine = (await import(String(ENGINE))).default
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx, { systemPrompt: { persona: scenario.persona } })
   await ctx.plugin(AgentLoop, { agents: [] })
-  await ctx.plugin(LlmDeepSeek, { models: [{ id: 'deepseek-v4-flash', contextWindow: scenario.engine.modelContextLimit }] })
+  await ctx.plugin(LlmDeepSeekApiKey, { models: [{ id: 'deepseek-v4-flash', contextWindow: scenario.engine.modelContextLimit }] })
   await ctx.plugin(TokenMeter)
   await ctx.plugin(AcpEngine, { ...scenario.engine })
   const agent = await ctx.agentLoop.create(SessionId(scenario.name), {

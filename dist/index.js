@@ -5793,13 +5793,40 @@ function resolveAcpSettings(input) {
   };
 }
 var AcpSettingsSchema = z.object({
-  modelContextLimit: z.number().step(1).min(1),
-  autoModelContextLimit: z.boolean().default(SETTING_DEFAULTS.autoModelContextLimit),
-  nudgeMinContextLimitPct: z.number().min(0).max(1),
-  nudgeMaxContextLimitPct: z.number().min(0).max(1).default(SETTING_DEFAULTS.nudgeMaxContextLimitPct),
-  nudgeEmergencyThresholdPct: z.number().min(0).max(1).default(SETTING_DEFAULTS.nudgeEmergencyThresholdPct),
-  autoNudge: z.boolean().default(SETTING_DEFAULTS.autoNudge)
+  modelContextLimit: z.number().step(1).min(1).volatile(),
+  autoModelContextLimit: z.boolean().volatile(),
+  nudgeMinContextLimitPct: z.number().min(0).max(1).volatile(),
+  nudgeMaxContextLimitPct: z.number().min(0).max(1).volatile(),
+  nudgeEmergencyThresholdPct: z.number().min(0).max(1).volatile(),
+  autoNudge: z.boolean().volatile()
 });
+function isVolatileField(value) {
+  return typeof value === "object" && value !== null && typeof value.get === "function";
+}
+function readConfigField(value) {
+  return isVolatileField(value) ? value.get() : value;
+}
+function readSettingsInput(config) {
+  const entry = {};
+  const modelContextLimit = readConfigField(config.modelContextLimit);
+  if (modelContextLimit !== void 0) entry.modelContextLimit = modelContextLimit;
+  const autoModelContextLimit = readConfigField(config.autoModelContextLimit);
+  if (autoModelContextLimit !== void 0) entry.autoModelContextLimit = autoModelContextLimit;
+  const nudgeMinContextLimitPct = readConfigField(config.nudgeMinContextLimitPct);
+  if (nudgeMinContextLimitPct !== void 0) entry.nudgeMinContextLimitPct = nudgeMinContextLimitPct;
+  const nudgeMaxContextLimitPct = readConfigField(config.nudgeMaxContextLimitPct);
+  if (nudgeMaxContextLimitPct !== void 0) entry.nudgeMaxContextLimitPct = nudgeMaxContextLimitPct;
+  const nudgeEmergencyThresholdPct = readConfigField(config.nudgeEmergencyThresholdPct);
+  if (nudgeEmergencyThresholdPct !== void 0) entry.nudgeEmergencyThresholdPct = nudgeEmergencyThresholdPct;
+  const autoNudge = readConfigField(config.autoNudge);
+  if (autoNudge !== void 0) entry.autoNudge = autoNudge;
+  return entry;
+}
+function withoutSettingsKeys(config) {
+  const rest = { ...config };
+  for (const key of SETTINGS_KEYS) delete rest[key];
+  return rest;
+}
 function describeSettingsChange(prev, next) {
   const warnings = [];
   if (next.nudgeMinContextLimitPct !== void 0 && next.nudgeMinContextLimitPct >= next.nudgeMaxContextLimitPct) {
@@ -5837,7 +5864,7 @@ function requireService(getService) {
   }
   return service;
 }
-function makeSettingsCommandSurface(getService, getSnapshot) {
+function makeSettingsCommandSurface(getService, getSnapshot, getEntryId) {
   return {
     get available() {
       return getService() !== void 0;
@@ -5846,13 +5873,14 @@ function makeSettingsCommandSurface(getService, getSnapshot) {
     describe() {
       const service = getService();
       if (service === void 0) return void 0;
-      return service.describe().find((descriptor) => String(descriptor.ns) === ACP_SETTINGS_NAMESPACE);
+      const entryId = getEntryId();
+      return service.describe().find((descriptor) => String(descriptor.ns) === entryId);
     },
     async update(patch) {
-      await requireService(getService).update(ACP_SETTINGS_NAMESPACE, patch);
+      await requireService(getService).update(getEntryId(), patch);
     },
     async replaceSection(section) {
-      await requireService(getService).replace(ACP_SETTINGS_NAMESPACE, section);
+      await requireService(getService).replace(getEntryId(), section);
     }
   };
 }
@@ -6195,16 +6223,23 @@ function resolvePresetThresholds(base, config) {
     nudgeEmergencyThresholdPct: config.nudgeEmergencyThresholdPct ?? preset.nudgeEmergencyThresholdPct
   };
 }
-function presetFilledSettingsEntry(config) {
-  const entry = filterSettingsEntry(config);
-  if (config.preset === void 0) return entry;
-  const preset = resolvePreset(config.preset);
+function presetFilledSettingsEntry(entry, presetName) {
+  if (presetName === void 0) return entry;
+  const preset = resolvePreset(presetName);
   return {
     ...entry,
-    nudgeMinContextLimitPct: config.nudgeMinContextLimitPct ?? preset.nudgeMinContextLimitPct,
-    nudgeMaxContextLimitPct: config.nudgeMaxContextLimitPct ?? preset.nudgeMaxContextLimitPct,
-    nudgeEmergencyThresholdPct: config.nudgeEmergencyThresholdPct ?? preset.nudgeEmergencyThresholdPct
+    nudgeMinContextLimitPct: entry.nudgeMinContextLimitPct ?? preset.nudgeMinContextLimitPct,
+    nudgeMaxContextLimitPct: entry.nudgeMaxContextLimitPct ?? preset.nudgeMaxContextLimitPct,
+    nudgeEmergencyThresholdPct: entry.nudgeEmergencyThresholdPct ?? preset.nudgeEmergencyThresholdPct
   };
+}
+function sameSettings(prev, next) {
+  return prev.modelContextLimit === next.modelContextLimit && prev.autoModelContextLimit === next.autoModelContextLimit && prev.nudgeMinContextLimitPct === next.nudgeMinContextLimitPct && prev.nudgeMaxContextLimitPct === next.nudgeMaxContextLimitPct && prev.nudgeEmergencyThresholdPct === next.nudgeEmergencyThresholdPct && prev.autoNudge === next.autoNudge;
+}
+function settingsEntryIdOf(ctx) {
+  const fiber = ctx.fiber;
+  const id = fiber.entry?.options?.id;
+  return typeof id === "string" && id.length > 0 ? id : ACP_SETTINGS_NAMESPACE;
 }
 function assertNudgeThresholdOrder(config) {
   const { nudgeMinContextLimitPct: min, nudgeMaxContextLimitPct: max, nudgeEmergencyThresholdPct: emergency } = config;
@@ -6220,6 +6255,15 @@ function assertNudgeThresholdOrder(config) {
   }
 }
 var AcpCompactionEngine = class extends CompactionEngine {
+  /**
+   * The cordis Config schema — the host's settings form for this plugin.
+   * dsh-settings >= 0.2.0 projects a form per loader entry from its exported
+   * `Config` and only accepts runtime edits on `.volatile()` fields, so the
+   * six scalar knobs live here (see `src/settings.ts`). Unknown keys on a
+   * composition row (prompts, coreOverrides, countTokens, preset, …) are
+   * preserved untouched by schemastery object resolution.
+   */
+  static Config = AcpSettingsSchema;
   /** The framework-agnostic ACP compression core, reused verbatim. */
   kernel;
   /** Per-session kernel state. */
@@ -6243,10 +6287,14 @@ var AcpCompactionEngine = class extends CompactionEngine {
   compressCallIdsToHide = /* @__PURE__ */ new Set();
   /** Per provider/model route the resolved window (probe failures cached too). */
   windowCache = /* @__PURE__ */ new Map();
-  /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (SettingsProvider.installSection). */
+  /** Live settings snapshot thunk — reads the volatile config fields, so a settings-form edit is visible on the next read. */
   readSettingsSource = () => resolveAcpSettings({});
+  /** The last snapshot the diff handler saw, so a live edit can be noticed at pre-step (SettingsForms has no change callback). */
+  currentSettings = resolveAcpSettings({});
   /** The settings service, captured lazily for /acp-prune config (undefined in provider-less processes). */
   settingsService;
+  /** This plugin's profile entry id — the key the host files its settings form under (falls back to the composition row id). */
+  settingsEntryId = ACP_SETTINGS_NAMESPACE;
   /** /acp-prune config read/write surface. */
   settingsCommand;
   /** Per route the adapter's per-request output cap (the output reservation); null = undisclosed. */
@@ -6257,52 +6305,33 @@ var AcpCompactionEngine = class extends CompactionEngine {
   overflowSessions = /* @__PURE__ */ new Map();
   constructor(ctx, config = {}) {
     super(ctx);
-    this.config = resolveAcpConfig(config);
-    this.prompts = resolvePrompts2(config.prompts);
+    const row = { ...withoutSettingsKeys(config), ...readSettingsInput(config) };
+    this.config = resolveAcpConfig(row);
+    this.prompts = resolvePrompts2(row.prompts);
     const ports = this.config.countTokens !== void 0 ? { countTokens: this.config.countTokens } : {};
     this.kernel = createCore(ports);
     setDocCacheCap(128 * 1024 * 1024);
     this.store = new AcpStateStore();
-    const compositionEntry = presetFilledSettingsEntry(config);
-    let current = resolveAcpSettings(compositionEntry);
-    this.readSettingsSource = () => current;
-    const engine = this;
-    const applySettings = () => {
-      const next = this.readSettingsSource();
-      const prev = current;
-      current = next;
-      try {
-        engine.onSettingsChanged(prev, next);
-      } catch (error) {
-        this.ctx.logger.warn(`billion-context-dsh: applying settings change failed: ${String(error)}`);
-      }
-    };
-    this.settingsCommand = makeSettingsCommandSurface(() => this.settingsService, () => current);
+    const liveEntry = () => presetFilledSettingsEntry(readSettingsInput(config), config.preset);
+    this.readSettingsSource = () => resolveAcpSettings(liveEntry());
+    this.currentSettings = this.readSettingsSource();
+    this.settingsEntryId = settingsEntryIdOf(ctx);
+    this.settingsCommand = makeSettingsCommandSurface(
+      () => this.settingsService,
+      // Read live, never from `currentSettings`: a form write must be visible
+      // to `/acp-prune config list` before the next pre-step diff runs.
+      () => this.readSettingsSource(),
+      () => this.settingsEntryId
+    );
     if (this.config.settingsEnabled !== false) {
       ctx.inject(["settings"], (settingsCtx) => {
-        if (typeof settingsCtx.settings?.installSection !== "function") {
-          this.ctx.logger.warn(
-            "billion-context-dsh: host settings service has no installSection (removed in dsh-settings >= 0.1.7) \u2014 the compaction-acp settings section is not registered; the six knobs keep their composition values and /acp-prune config reports the section unavailable"
-          );
-          return void 0;
-        }
-        settingsCtx.settings.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, compositionEntry, {
-          // The seam's source type follows the entry it registered, so `source`
-          // is a partial view of the settings; re-resolve it into a
-          // fully-defaulted snapshot so every reader sees the same shape the
-          // composition path produced.
-          setSource: (source) => {
-            this.readSettingsSource = () => resolveAcpSettings(source());
-          },
-          onChange: applySettings
-        });
         this.settingsService = settingsCtx.settings;
         return () => {
           this.settingsService = void 0;
-          this.readSettingsSource = () => current;
         };
       });
     }
+    const engine = this;
     const env = {
       kernel: this.kernel,
       store: this.store,
@@ -6374,16 +6403,15 @@ var AcpCompactionEngine = class extends CompactionEngine {
         }
       }
       if (event.type !== "tool/result") return;
-      const message = event.data.message;
-      const block = message.content[0];
-      const callId = block?.toolCallId ?? message.source.callId;
-      if (typeof callId !== "string" || !this.compressCallIdsToHide.has(callId)) return;
+      const callId = toolCallIdOfResultEvent(event);
+      if (callId === null || !this.compressCallIdsToHide.has(callId)) return;
       this.compressCallIdsToHide.delete(callId);
       deferCompressPairHide(session, callId, event.seq, (error) => {
         ctx.logger.warn(`billion-context-dsh: hide compress call/result pair failed: ${String(error)}`);
       });
     });
     ctx.on("agent/pre-step", async (payload, next) => {
+      this.syncSettings();
       stripOrphanedSurfaceToolMessages(payload.agent.session);
       if (!engine.readSettingsSource().autoNudge) return next();
       const decision = await next();
@@ -6536,6 +6564,24 @@ var AcpCompactionEngine = class extends CompactionEngine {
    * edited settings.yaml, and an invalid stored section would fail the next
    * boot loud anyway).
    */
+  /**
+   * Land a live settings change: re-read the snapshot and run the diff handler
+   * when it moved. dsh-settings >= 0.2.0 has no change callback (the 0.1.5
+   * seam's `onChange` is gone), so the diff runs at the first `agent/pre-step`
+   * of every step — the same place every consumer reads the live values from,
+   * which is why a form edit cannot reach reads while the caches stay stale.
+   */
+  syncSettings() {
+    const next = this.readSettingsSource();
+    const prev = this.currentSettings;
+    if (sameSettings(prev, next)) return;
+    this.currentSettings = next;
+    try {
+      this.onSettingsChanged(prev, next);
+    } catch (error) {
+      this.ctx.logger.warn(`billion-context-dsh: applying settings change failed: ${String(error)}`);
+    }
+  }
   onSettingsChanged(prev, next) {
     const effect = describeSettingsChange(prev, next);
     for (const warning of effect.warnings) {
@@ -6706,6 +6752,7 @@ export {
   parseSettingValue,
   projectEvent,
   projectedContextWindow,
+  readSettingsInput,
   rebuildBlockLedger,
   renderSystemPrompt,
   renderTemplate,
@@ -6720,6 +6767,7 @@ export {
   stripOrphanedSurfaceToolMessages,
   summarySeqOfKernelBlock,
   surfaceEventsOf,
-  windowSourceLabel
+  windowSourceLabel,
+  withoutSettingsKeys
 };
 //# sourceMappingURL=index.js.map

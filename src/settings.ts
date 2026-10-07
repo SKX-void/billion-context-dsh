@@ -1,14 +1,16 @@
 /**
  * M6 — runtime settings integration. Wires the engine's scalar knobs into the
- * host's user-settings layer (`~/.dsh/settings.yaml`, section
- * `compaction-acp`) through the official consumer seam
- * `SettingsProvider.installSection` (@deepseek-ai/dsh-settings), so editing the file
- * applies to RUNNING sessions without a restart.
+ * host's settings form through the dsh-settings >= 0.2.0 seam
+ * (`SettingsForms`), which projects one form per loader entry from that
+ * entry's Config schema and requires its fields to be volatile. Editing the
+ * form re-resolves the entry config in place, so a change applies to RUNNING
+ * sessions without a restart.
  *
- * Layering (per key): schemastery schema default → composition-row subset
- * (the `base` layer, filtered by `filterSettingsEntry`) → user section.
- * The `/acp-prune config` slash command reads and writes the same namespace
- * through the `SettingsCommandSurface` built here.
+ * Layering (per key): engine default, then the inherited composition layer
+ * (`base`), then the profile patch override (`user`); both layers are read
+ * back from the host's `describe()` for this plugin's own entry id, so the
+ * engine keeps no second store. The `/acp-prune config` slash command reads
+ * and writes that form through the `SettingsCommandSurface` built here.
  *
  * Deliberately NOT exposed through settings: `coreOverrides`, `countTokens`,
  * `autoTools`, `autoCommand`, `prompts` (object/function values or
@@ -19,14 +21,13 @@
  */
 
 import z from '@deepseek-ai/schemastery'
-import type { SettingsDescriptor, SettingsProvider } from '@deepseek-ai/dsh-settings'
+import type { SettingsDescriptor, SettingsForms } from '@deepseek-ai/dsh-settings'
 
 /**
- * The host settings namespace — same id as the bundle/composition row, so "the
- * settings.yaml section" and "the cordis.patch.yml row" are one mental object.
- * A plain string literal as of the 0.1.5 line: the seam's `settingsNamespace()`
- * runtime helper is gone and the brand is applied at the call site instead
- * (`installSection`'s `Namespace & SettingsNamespaceInput<Namespace>`).
+ * The settings entry id: the composition row id in cordis.patch.yml, which is
+ * also the key the host files this plugin settings form under. Used as the
+ * FALLBACK when the engine is built outside the loader (unit tests,
+ * programmatic mounts), where no profile entry exists.
  */
 export const ACP_SETTINGS_NAMESPACE = 'compaction-acp'
 
@@ -115,19 +116,87 @@ export function resolveAcpSettings(input: AcpSettingsInput): AcpSettings {
 }
 
 /**
- * The settings schema. Defaults here are the ENGINE defaults (0.70/0.85),
- * not the kernel's 0.75/0.95 — an untouched namespace must reproduce exactly
- * today's behavior. Integer constraint uses `.step(1).min(1)` because
+ * The plugin's cordis Config schema, and therefore the host settings form:
+ * dsh-settings >= 0.2.0 (`SettingsForms`) projects one form per loader entry
+ * from the entry's exported `Config`, and it refuses a runtime edit unless the
+ * field is `.volatile()` ("Plugin entry ... has no volatile fields"). Editing
+ * the form re-resolves the entry config in place, so every reader below sees
+ * the new value without a restart.
+ *
+ * NO `.default()` on any field, deliberately: the schema resolver applies
+ * defaults EAGERLY, so a defaulted `nudge*Pct` would be indistinguishable from
+ * an explicit row value and would mask `config.preset` (issue #176). Engine
+ * defaults live in `SETTING_DEFAULTS` / `resolveAcpSettings` and are applied at
+ * READ time instead. Integer constraint uses `.step(1).min(1)` because
  * schemastery 3.18.x has no `.int()`/`.positive()` helpers.
  */
 export const AcpSettingsSchema = z.object({
-  modelContextLimit: z.number().step(1).min(1),
-  autoModelContextLimit: z.boolean().default(SETTING_DEFAULTS.autoModelContextLimit),
-  nudgeMinContextLimitPct: z.number().min(0).max(1),
-  nudgeMaxContextLimitPct: z.number().min(0).max(1).default(SETTING_DEFAULTS.nudgeMaxContextLimitPct),
-  nudgeEmergencyThresholdPct: z.number().min(0).max(1).default(SETTING_DEFAULTS.nudgeEmergencyThresholdPct),
-  autoNudge: z.boolean().default(SETTING_DEFAULTS.autoNudge),
+  modelContextLimit: z.number().step(1).min(1).volatile(),
+  autoModelContextLimit: z.boolean().volatile(),
+  nudgeMinContextLimitPct: z.number().min(0).max(1).volatile(),
+  nudgeMaxContextLimitPct: z.number().min(0).max(1).volatile(),
+  nudgeEmergencyThresholdPct: z.number().min(0).max(1).volatile(),
+  autoNudge: z.boolean().volatile(),
 })
+
+/** A schemastery volatile field as it appears on a resolved cordis config. */
+interface VolatileField<T> {
+  get(): T
+}
+
+function isVolatileField(value: unknown): value is VolatileField<unknown> {
+  return typeof value === 'object' && value !== null && typeof (value as { get?: unknown }).get === 'function'
+}
+
+/**
+ * Read one config field that may be a volatile wrapper (the loader hands the
+ * engine a SCHEMA-RESOLVED config, where every declared settings field is a
+ * `Volatile` object) or a plain value (direct construction in tests and
+ * programmatic mounts).
+ */
+function readConfigField<T>(value: T | VolatileField<T | undefined> | undefined): T | undefined {
+  return isVolatileField(value) ? value.get() as T | undefined : value as T | undefined
+}
+
+/**
+ * The six knobs of a resolved cordis config as a plain settings input, read
+ * LIVE (a volatile field's `get()` always answers the current value).
+ *
+ * Absent keys are OMITTED, never written as `undefined`: `resolveAcpConfig`
+ * spreads this over `DEFAULT_CONFIG`, and a present-but-undefined key would
+ * erase the default (the same trap `maxOverflowRetries` documents).
+ */
+/** Mutable view of the input shape (`AcpSettings` fields are readonly). */
+type MutableSettingsInput = { -readonly [K in keyof AcpSettingsInput]: AcpSettingsInput[K] }
+
+export function readSettingsInput(config: AcpSettingsInput): AcpSettingsInput {
+  const entry: MutableSettingsInput = {}
+  const modelContextLimit = readConfigField(config.modelContextLimit)
+  if (modelContextLimit !== undefined) entry.modelContextLimit = modelContextLimit
+  const autoModelContextLimit = readConfigField(config.autoModelContextLimit)
+  if (autoModelContextLimit !== undefined) entry.autoModelContextLimit = autoModelContextLimit
+  const nudgeMinContextLimitPct = readConfigField(config.nudgeMinContextLimitPct)
+  if (nudgeMinContextLimitPct !== undefined) entry.nudgeMinContextLimitPct = nudgeMinContextLimitPct
+  const nudgeMaxContextLimitPct = readConfigField(config.nudgeMaxContextLimitPct)
+  if (nudgeMaxContextLimitPct !== undefined) entry.nudgeMaxContextLimitPct = nudgeMaxContextLimitPct
+  const nudgeEmergencyThresholdPct = readConfigField(config.nudgeEmergencyThresholdPct)
+  if (nudgeEmergencyThresholdPct !== undefined) entry.nudgeEmergencyThresholdPct = nudgeEmergencyThresholdPct
+  const autoNudge = readConfigField(config.autoNudge)
+  if (autoNudge !== undefined) entry.autoNudge = autoNudge
+  return entry
+}
+
+/**
+ * A resolved config with the six settings keys REMOVED. Their values must never
+ * reach `resolveAcpConfig` in wrapper form (a `Volatile` object spread over
+ * `DEFAULT_CONFIG` would become the configured value); `readSettingsInput`
+ * supplies the plain values instead.
+ */
+export function withoutSettingsKeys<T extends object>(config: T): Omit<T, SettingsKey> {
+  const rest = { ...config } as Record<string, unknown>
+  for (const key of SETTINGS_KEYS) delete rest[key]
+  return rest as Omit<T, SettingsKey>
+}
 
 /** What changed between two settings snapshots, and what the engine must do about it. */
 export interface SettingsChangeEffect {
@@ -213,7 +282,7 @@ export interface SettingsCommandSurface {
   replaceSection(section: Record<string, unknown>): Promise<void>
 }
 
-function requireService(getService: () => SettingsProvider | undefined): SettingsProvider {
+function requireService(getService: () => SettingsForms | undefined): SettingsForms {
   const service = getService()
   if (service === undefined) {
     throw new Error('runtime settings are not available in this process')
@@ -226,10 +295,15 @@ function requireService(getService: () => SettingsProvider | undefined): Setting
  * engine captures the service through a parallel `ctx.inject(['settings'])`,
  * so the reference may legitimately be undefined for the whole process life
  * (headless/plain compositions have no settings provider).
+ *
+ * `getEntryId` answers this plugin's profile entry id — dsh-settings >= 0.2.0
+ * files forms and writes BY ENTRY ID (`update(ns, patch)`), not by a namespace
+ * the plugin registers for itself.
  */
 export function makeSettingsCommandSurface(
-  getService: () => SettingsProvider | undefined,
+  getService: () => SettingsForms | undefined,
   getSnapshot: () => AcpSettings,
+  getEntryId: () => string,
 ): SettingsCommandSurface {
   return {
     get available() {
@@ -239,15 +313,16 @@ export function makeSettingsCommandSurface(
     describe() {
       const service = getService()
       if (service === undefined) return undefined
+      const entryId = getEntryId()
       // `descriptor.ns` carries the seam's compile-time brand, which a plain
       // literal never satisfies — compare through String() instead.
-      return service.describe().find((descriptor) => String(descriptor.ns) === ACP_SETTINGS_NAMESPACE)
+      return service.describe().find((descriptor) => String(descriptor.ns) === entryId)
     },
     async update(patch) {
-      await requireService(getService).update(ACP_SETTINGS_NAMESPACE, patch)
+      await requireService(getService).update(getEntryId(), patch)
     },
     async replaceSection(section) {
-      await requireService(getService).replace(ACP_SETTINGS_NAMESPACE, section)
+      await requireService(getService).replace(getEntryId(), section)
     },
   }
 }

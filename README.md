@@ -74,19 +74,27 @@ dsh plugin --profile web add billion-context-dsh
 > **与 DSH 版本的兼容性。** 包把五个运行期 seam 包（`dsh-compaction` /
 > `dsh-session` / `dsh-llm` / `dsh-tools` / `dsh-settings`）都声明为 peer
 > 依赖，共享同一个
-> 范围 `>=0.1.5-alpha.1 <0.1.6-0`——恰好是整条 `0.1.5` 线（所有预发布加最终
-> `0.1.5`）。从 `0.1.5` 线起，会话 replace 操作的协议字段由 `{ op, start, end }`
-> 改名为 `{ op, startSeq, endSeq }`，且校验严格（只接受这三个字段）；本引擎只
-> 输出新形态，因此在更旧的 DSH（< 0.1.5）上每次 `compress` 都会被宿主在运行时
-> 拒绝（issue #136）——旧版本不再受支持，请先升级 DSH 再安装本发行版。范围
-> 写成显式区间而非 caret 是**有意为之**：caret 会悄悄放进未经验证的 0.1.6+
-> 线。把这五个 seam 包一并声明为 peer（而不只是 `dsh-compaction`），是为了让
-> 安装在 pnpm 的集成/封存布局下仍能把它们解析到**宿主自己的副本**，而不是
-> 某个与宿主不一致的陈旧嵌套副本。
+> 范围 `>=0.2.0-rc.2 <0.2.1-0`——整条 `0.2.0` 线（从已验证的 `0.2.0-rc.2`
+> 起，含最终 `0.2.0`）。`0.2.0` 线相对 `0.1.x` 有三处破坏性接缝变更，本发行版
+> 按新接缝重写后**只支持 `0.2.0` 线**：(a) `dsh-settings` 删除
+> `SettingsProvider.installSection`，改为按 **profile 条目 id** 投影的
+> `SettingsForms`（`describe` / `update` / `replace` / `mutate`）——六个可调键
+> 现在是插件自身的 `static Config`，且必须是 `.volatile()` 字段才能被运行时改写；
+> (b) `dsh-llm` 的模块增强点从 `@deepseek-ai/dsh-llm/message` 移到包根，且
+> `ContentBlock` 不再带顶层 `toolCallId`（工具结果 id 统一走
+> `toolCallIdOfResultEvent` 提取）；(c) `dsh-llm-deepseek` 拆出
+> `dsh-llm-deepseek-api-key`（provider 注册与 API key 解析），协议侧改说
+> Anthropic-Messages SSE。更旧的 DSH（`0.1.x`）不再受支持，请先升级宿主再安装
+> 本发行版。范围写成显式区间而非 caret 是**有意为之**：caret 会悄悄放进未经验证
+> 的 `0.2.1+` 线（`0.2.0-rc.1` 同线但未验证，同样不收）。把这五个 seam 包一并
+> 声明为 peer（而不只是 `dsh-compaction`），是为了让安装在 pnpm 的集成/封存布局
+> 下仍能把它们解析到**宿主自己的副本**，而不是某个与宿主不一致的陈旧嵌套副本。
 >
-> 行为注记（0.1.5 起）：宿主不再允许"不可见"替换节点，引擎清理孤立工具消息时
-> 会在其位置留下一条短可见占位消息；宿主的系统提示节点（surface node 0）被排除
-> 在可压缩范围表之外。
+> 行为注记：宿主不再允许"不可见"替换节点，引擎清理孤立工具消息时会在其位置留下
+> 一条短可见占位消息；宿主的系统提示节点（surface node 0）被排除在可压缩范围表
+> 之外；`agent/pre-step` 在宿主侧**先于**本轮 inbox 消息落盘运行，因此 nudge 读到
+> 的上下文压力是上一轮的占用（阈值跨越比 `0.1.5` 宿主晚一轮；压力本身仍取自
+> `contextPressure.projectedTokens`，与 UI 口径一致）。
 
 **方式二：纯 `npm install`（只装包，需要手写组合行）。**
 
@@ -164,7 +172,7 @@ compaction-acp:
 /acp-prune config reset all
 ```
 
-窗口相关键（`modelContextLimit` / `autoModelContextLimit`）改动会清空窗口探测缓存——下一次 pre-step 按新值重新探测（探测失败也会被缓存，正是靠这个机制在修复网关后重新探测）。无 settings provider 的纯 npm 安装组合下 `/acp-prune config` 降级为指引文案；DSH 0.1.7+ 宿主线（settings 服务已移除 `installSection`，在本插件声明的 peer 区间之外）同样干净降级：启动时记一条 warn，六个键改由组合行 `config:` 调整，引擎与工具不受影响（issue #173）；`settingsEnabled: false` 可整体关闭该集成（组合行专用，不进 settings 层——开关不能关掉自己）。设计细节见 [docs/settings-integration-design.md](docs/settings-integration-design.md)。
+窗口相关键（`modelContextLimit` / `autoModelContextLimit`）改动会清空窗口探测缓存——下一次 pre-step 按新值重新探测（探测失败也会被缓存，正是靠这个机制在修复网关后重新探测）。无 settings provider 的纯 npm 安装组合下 `/acp-prune config` 降级为指引文案。`0.2.0` 线的接缝是 `SettingsForms`：六个键就是插件自己的 `static Config`（全部 `.volatile()`、**不带默认值**，默认值由引擎在读取时施加），宿主按 profile 条目 id 投影表单，`/acp-prune config set/reset` 走 `update` / `replace(entryId)`——运行时改写由 loader 原地提交（同一份 volatile 引用，**不重挂载**），引擎在每步 `agent/pre-step` 做一次六值 diff 热生效；`settingsEnabled: false` 可整体关闭该集成（组合行专用，不进 settings 层——开关不能关掉自己）。设计细节见 [docs/settings-integration-design.md](docs/settings-integration-design.md)。
 
 **单模式生效（agent preset 的 `compaction` realm）**。先在该 realm 内*禁用（或删除）原有的 `dsh-compaction-basic` 行*，再插入本引擎——同一 realm 内两个后端不能并存：
 

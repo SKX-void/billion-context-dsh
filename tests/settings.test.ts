@@ -1,25 +1,30 @@
 /**
- * M6 — runtime settings integration tests (phase 1, issue #75).
+ * M6 — runtime settings integration tests (issue #75 phase 1, ported to the
+ * 0.2.0 settings seam).
  *
- * Coverage map (design doc §6):
- *  - pure units: filterSettingsEntry whitelist, engine-default mirror,
- *    schema default parity, schema boundaries (integer / inclusive pct),
- *    parseSettingValue (incl. the `false` regression), describeSettingsChange
- *    diff flags, command-surface degradation without a service;
- *  - E2E: a REAL engine on a bare cordis Context with an in-memory settings
- *    provider — external edits hot-apply to the live env, /acp-prune config
- *    list/set/reset round-trips, the kill switch ignores the provider;
- *  - regression locks added in review: the filtered `base` entry, the
- *    seam-to-window gate, the kernelConfigFor output, provider detach
- *    fallback, and reset preserving hand-written keys;
- *  - V1 gate: dispose-then-remount the same namespace (HMR-style reload)
- *    must not hit "settings namespace is already registered".
+ * The 0.2.0 seam (`SettingsForms`) does not let a plugin register a namespace:
+ * it projects one form per LOADER ENTRY from the entry's exported Config schema
+ * and writes by ENTRY ID. So the plugin's six knobs ARE its `static Config`
+ * (`AcpSettingsSchema`, every field `.volatile()`), and the engine reads them
+ * through the live volatile references the loader hands it — a form write is
+ * committed IN PLACE (`Entry.update` → `updateVolatile`), no remount.
+ *
+ * Coverage map:
+ *  - pure units: filterSettingsEntry whitelist, engine-default mirror, the
+ *    Config schema (volatile fields, NO defaults, integer / inclusive pct
+ *    bounds), readSettingsInput / withoutSettingsKeys, parseSettingValue,
+ *    describeSettingsChange diff flags, command-surface degradation;
+ *  - E2E: a real engine on a bare cordis Context with loader-shaped volatile
+ *    refs — live reads follow a volatile commit (no remount), /acp-prune config
+ *    list/set/reset round-trips through a forms-like service keyed by entry id,
+ *    the entry id comes from the owning profile entry, the kill switch ignores
+ *    the service, a detached service is dropped, and reset preserves keys the
+ *    six-key schema does not know.
  */
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context, Service, type Message } from '@deepseek-ai/cordis'
-import { SettingsProvider, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { Session } from '@deepseek-ai/dsh-session'
 import {
@@ -29,8 +34,13 @@ import {
   filterSettingsEntry,
   makeSettingsCommandSurface,
   parseSettingValue,
+  readSettingsInput,
   resolveAcpSettings,
+  SETTINGS_KEYS,
   SETTING_DEFAULTS,
+  withoutSettingsKeys,
+  type AcpSettingsInput,
+  type SettingsKey,
 } from '../src/settings.ts'
 import { AcpCompactionEngine, resolveAcpConfig, type AcpConfig } from '../src/index.ts'
 import { kernelConfigFor } from '../src/config.ts'
@@ -38,39 +48,124 @@ import { acpCommand } from '../src/commands.ts'
 import type { ToolEnvironment } from '../src/tools.ts'
 import { DEFAULT_CONTEXT_WINDOW } from '../src/window.ts'
 
-/** In-memory settings provider: load/persist over a plain map; tests push external edits through publishForTest. */
-class MemorySettingsProvider extends SettingsProvider {
-  static provide = 'settings'
-  readonly writable = true
-  private stored: Record<string, unknown> = {}
-
-  protected override async load(): Promise<Record<string, unknown>> {
-    return this.stored
-  }
-
-  protected override async persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
-    this.stored[String(ns)] = section
-  }
-
-  /** Simulate an external edit (someone editing settings.yaml on disk). */
-  publishForTest(doc: Record<string, unknown>): void {
-    this.publish(doc)
-  }
+/**
+ * Stand-in for a schemastery volatile field as the LOADER hands it to a plugin:
+ * a stable reference whose `get()` always answers the live entry config
+ * (`createVolatile` in @deepseek-ai/cosmokit; the loader commits a form write
+ * with `updateVolatile(ref, source)` — same reference, new value, no remount).
+ */
+interface VolatileRef<T> {
+  get(): T | undefined
+  set(value: T | undefined): void
 }
 
-/** Let the async watcher chain (commit → watch → onChange) settle. */
-async function flushRounds(rounds = 3): Promise<void> {
-  for (let index = 0; index < rounds; index += 1) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
+function volatileRef<T>(initial?: T): VolatileRef<T> {
+  let current = initial
+  return { get: () => current, set: (value) => { current = value } }
+}
+
+interface LoaderConfig {
+  config: Partial<AcpConfig>
+  refs: Record<SettingsKey, VolatileRef<unknown>>
 }
 
 /**
- * Mount the real engine as a composition-row-like plugin on a fresh fork of
- * `root`. `prepare` runs BEFORE construction — used to register log exporters
- * that must exist before the engine's constructor may emit.
+ * A composition row as the loader resolves it: the six declared settings fields
+ * arrive as volatile references over the live entry config, every other field
+ * passes through untouched.
  */
-async function mountEngine(root: Context, config: Partial = {}, prepare?: (ctx: Context) => void): Promise<{ fiber: { dispose: () => Promise<void> }; engine: AcpCompactionEngine }> {
+function loaderConfig(entry: AcpSettingsInput, extra: Partial<AcpConfig> = {}): LoaderConfig {
+  const refs: Record<SettingsKey, VolatileRef<unknown>> = {
+    modelContextLimit: volatileRef<unknown>(entry.modelContextLimit),
+    autoModelContextLimit: volatileRef<unknown>(entry.autoModelContextLimit),
+    nudgeMinContextLimitPct: volatileRef<unknown>(entry.nudgeMinContextLimitPct),
+    nudgeMaxContextLimitPct: volatileRef<unknown>(entry.nudgeMaxContextLimitPct),
+    nudgeEmergencyThresholdPct: volatileRef<unknown>(entry.nudgeEmergencyThresholdPct),
+    autoNudge: volatileRef<unknown>(entry.autoNudge),
+  }
+  return { config: { ...refs, ...extra } as unknown as Partial<AcpConfig>, refs }
+}
+
+/** Commit one knob the way the loader does (in place, on the existing ref). */
+function commit(refs: Record<SettingsKey, VolatileRef<unknown>>, key: SettingsKey, value: unknown): void {
+  refs[key]!.set(value)
+}
+
+/**
+ * Forms-like settings service (the 0.2.0 public surface: describe / update /
+ * replace / mutate, keyed by profile entry id). It also plays the LOADER half
+ * of a write — committing the new values into the running config references —
+ * because a unit test has no profile directory and no config editor.
+ */
+class MemorySettingsForms extends Service {
+  static provide = 'settings'
+  /** Entry ids the host files forms under; the engine must pick its own. */
+  namespaces: string[] = [ACP_SETTINGS_NAMESPACE]
+  /** The profile patch override layer (`user`) and the inherited layer (`base`). */
+  user: Record<string, unknown> = {}
+  base: Record<string, unknown> = {}
+  revision = 0
+  /** Every write the engine issued, so the entry-id contract is assertable. */
+  readonly writes: { ns: string; kind: 'update' | 'replace'; payload: Record<string, unknown> }[] = []
+  /** The loader-side effect of a write. */
+  refs: Record<SettingsKey, VolatileRef<unknown>> | undefined
+
+  private commitWrite(kind: 'update' | 'replace', payload: Record<string, unknown>): void {
+    if (this.refs === undefined) return
+    for (const key of SETTINGS_KEYS) {
+      if (key in payload) commit(this.refs, key, payload[key])
+      else if (kind === 'replace') commit(this.refs, key, this.base[key])
+    }
+  }
+
+  describe(): unknown[] {
+    return this.namespaces.map((ns) => ({
+      ns,
+      revision: this.revision,
+      autoGenerate: true,
+      applies: 'live',
+      schema: {},
+      value: {},
+      base: { ...this.base },
+      user: { ...this.user },
+    }))
+  }
+
+  /**
+   * The real seam validates every write through `resolveConfig(entry.fiber
+   * .runtime, next)` inside `configEditor.edit`, so an out-of-range value throws
+   * there — the fixture must throw too, or the command's write-failure path goes
+   * untested (rule 5: fixtures mirror real host behavior).
+   */
+  private validate(payload: Record<string, unknown>): void {
+    AcpSettingsSchema(payload)
+  }
+
+  async update(ns: string, patch: Record<string, unknown>): Promise<void> {
+    this.validate(patch)
+    this.writes.push({ ns, kind: 'update', payload: patch })
+    this.user = { ...this.user, ...patch }
+    this.commitWrite('update', patch)
+    this.revision += 1
+  }
+
+  async replace(ns: string, section: Record<string, unknown>): Promise<void> {
+    this.validate(section)
+    this.writes.push({ ns, kind: 'replace', payload: section })
+    this.user = { ...section }
+    this.commitWrite('replace', section)
+    this.revision += 1
+  }
+
+  async mutate(_ns: string, _ops: readonly unknown[]): Promise<void> {}
+}
+
+/** Mount the real engine as a composition-row-like plugin on a fresh fork of `root`. */
+async function mountEngine(
+  root: Context,
+  config: Partial<AcpConfig> = {},
+  prepare?: (ctx: Context) => void,
+): Promise<{ fiber: { dispose: () => Promise<void> }; engine: AcpCompactionEngine }> {
   let engine: AcpCompactionEngine | undefined
   const fiber = root.plugin((ctx) => {
     prepare?.(ctx)
@@ -79,30 +174,6 @@ async function mountEngine(root: Context, config: Partial = {}, prepare?: (ctx: 
   await fiber
   if (engine === undefined) throw new Error('engine did not mount')
   return { fiber, engine }
-}
-
-/**
- * Stand-in for dsh-settings >= 0.1.7 (issue #173): the service was renamed to
- * SettingsForms and `installSection` removed; its section API keys off profile
- * entry ids instead of plugin namespaces. Registered under the same `settings`
- * name so the engine's inject fires exactly like on a real 0.1.7 host. The
- * fixture mirrors the 0.1.7 public surface (configure/describe/update/replace/
- * mutate) and deliberately carries NO installSection — a fixture that grew the
- * method back would make the regression test vacuous (rule 5: fixtures mirror
- * real host structures).
- */
-class FormsLikeSettingsService extends Service {
-  static provide = 'settings'
-  readonly writable = false
-  configure(_presentation?: unknown): () => void {
-    return () => {}
-  }
-  describe(): unknown[] {
-    return []
-  }
-  async update(_ns: string, _patch: Record<string, unknown>): Promise<void> {}
-  async replace(_ns: string, _section: Record<string, unknown>): Promise<void> {}
-  async mutate(_ns: string, _ops: readonly unknown[]): Promise<void> {}
 }
 
 /** Drive /acp-prune through the real command handler (config paths never touch the agent). */
@@ -116,6 +187,11 @@ async function runAcp(env: ToolEnvironment, rawInput: string): Promise<string> {
   } as never)
   assert.equal(result.kind, 'success')
   return (result as { text: string }).text
+}
+
+/** Read a possibly-volatile schema field as its plain value. */
+function plain(value: unknown): unknown {
+  return typeof (value as { get?: unknown })?.get === 'function' ? (value as { get(): unknown }).get() : value
 }
 
 // ── Pure units ────────────────────────────────────────────────────────────
@@ -155,28 +231,78 @@ test('M6: engine defaults mirror SETTING_DEFAULTS (untouched settings reproduce 
   assert.equal(defaults.nudgeMinContextLimitPct, undefined)
 })
 
-test('M6: schema defaults equal engine defaults at runtime', () => {
-  // The schema output object OMITS keys whose value stays undefined (it has
-  // no own property for them), so compare per key instead of whole objects.
-  const viaSchema = AcpSettingsSchema({})
-  const viaEngine = resolveAcpSettings({})
-  for (const key of ['modelContextLimit', 'autoModelContextLimit', 'nudgeMinContextLimitPct', 'nudgeMaxContextLimitPct', 'nudgeEmergencyThresholdPct', 'autoNudge'] as const) {
-    assert.equal(viaSchema[key], viaEngine[key], `key ${key} resolves identically`)
+test('M6: the Config schema declares the six knobs VOLATILE and defaultless', () => {
+  // The host only accepts runtime edits on volatile fields, so every declared
+  // field must carry `meta.volatile` (the seam's `volatileForm` finds the form
+  // through exactly that flag).
+  const dict = (AcpSettingsSchema as unknown as { dict: Record<string, { meta?: Record<string, unknown> }> }).dict
+  assert.deepEqual(Object.keys(dict).sort(), [...SETTINGS_KEYS].sort())
+  for (const key of SETTINGS_KEYS) {
+    assert.equal(dict[key]?.meta?.volatile, true, `${key} must be volatile`)
+    // NO `.default()` anywhere: the resolver applies defaults eagerly, and a
+    // defaulted threshold would be indistinguishable from an explicit row value
+    // and mask `config.preset` (issue #176). Defaults are applied at READ time.
+    assert.equal('default' in (dict[key]?.meta ?? {}), false, `${key} must have no schema default`)
+  }
+  // And the resolved values really are live references, with nothing filled in.
+  const viaSchema = AcpSettingsSchema({}) as unknown as Record<string, unknown>
+  for (const key of SETTINGS_KEYS) {
+    assert.equal(plain(viaSchema[key]), undefined, `${key} must resolve to undefined`)
   }
 })
 
 test('M6: schema enforces an integer, at-least-1 context limit', () => {
-  assert.equal(AcpSettingsSchema({ modelContextLimit: 1 }).modelContextLimit, 1)
-  assert.equal(AcpSettingsSchema({ modelContextLimit: 200000 }).modelContextLimit, 200000)
+  assert.equal(plain(AcpSettingsSchema({ modelContextLimit: 1 }).modelContextLimit), 1)
+  assert.equal(plain(AcpSettingsSchema({ modelContextLimit: 200000 }).modelContextLimit), 200000)
   assert.throws(() => AcpSettingsSchema({ modelContextLimit: 0 }), />= 1/)
   assert.throws(() => AcpSettingsSchema({ modelContextLimit: 128000.5 }), /multiple of 1/)
 })
 
 test('M6: schema pct bounds are inclusive (0 and 1 accepted, outside rejected)', () => {
-  assert.equal(AcpSettingsSchema({ nudgeMaxContextLimitPct: 0, nudgeEmergencyThresholdPct: 0 }).nudgeMaxContextLimitPct, 0)
-  assert.equal(AcpSettingsSchema({ nudgeMaxContextLimitPct: 1, nudgeEmergencyThresholdPct: 1 }).nudgeEmergencyThresholdPct, 1)
+  const zero = AcpSettingsSchema({ nudgeMaxContextLimitPct: 0, nudgeEmergencyThresholdPct: 0 })
+  assert.equal(plain(zero.nudgeMaxContextLimitPct), 0)
+  const one = AcpSettingsSchema({ nudgeMaxContextLimitPct: 1, nudgeEmergencyThresholdPct: 1 })
+  assert.equal(plain(one.nudgeEmergencyThresholdPct), 1)
   assert.throws(() => AcpSettingsSchema({ nudgeMaxContextLimitPct: -0.1 }), />= 0/)
   assert.throws(() => AcpSettingsSchema({ nudgeEmergencyThresholdPct: 1.1 }), /<= 1/)
+})
+
+test('M6: readSettingsInput unwraps volatile refs and omits absent keys', () => {
+  const { refs } = loaderConfig({ nudgeMaxContextLimitPct: 0.6, autoNudge: false })
+  const entry = readSettingsInput(refs as unknown as AcpSettingsInput)
+  assert.deepEqual(entry, { nudgeMaxContextLimitPct: 0.6, autoNudge: false })
+  // Absent keys are OMITTED, never written as `undefined`: `resolveAcpConfig`
+  // spreads this over DEFAULT_CONFIG and a present-but-undefined key erases the
+  // default. `in` (not deepEqual) is the assertion that matters.
+  for (const key of SETTINGS_KEYS) {
+    if (key === 'nudgeMaxContextLimitPct' || key === 'autoNudge') continue
+    assert.equal(key in entry, false, `${key} must be absent, not undefined`)
+  }
+  // A later commit is visible immediately (the ref is live, not a snapshot).
+  commit(refs, 'nudgeMaxContextLimitPct', 0.55)
+  assert.equal(readSettingsInput(refs as unknown as AcpSettingsInput).nudgeMaxContextLimitPct, 0.55)
+  // Plain values (direct construction, unit tests) pass through unchanged.
+  assert.deepEqual(readSettingsInput({ nudgeMaxContextLimitPct: 0.5 }), { nudgeMaxContextLimitPct: 0.5 })
+})
+
+test('M6: readSettingsInput recognizes REAL schemastery volatile refs', () => {
+  // The critical integration point: the loader validates our Config schema, so
+  // what the constructor receives is exactly this shape.
+  const resolved = AcpSettingsSchema({ modelContextLimit: 64000, autoNudge: false }) as unknown as AcpSettingsInput
+  assert.deepEqual(readSettingsInput(resolved), { modelContextLimit: 64000, autoNudge: false })
+})
+
+test('M6: withoutSettingsKeys strips the six knobs and keeps every other field', () => {
+  const config = {
+    modelContextLimit: volatileRef(200000),
+    autoNudge: volatileRef(false),
+    preset: 'aggressive',
+    prompts: { nudge: { text: 'x' } },
+    countTokens: (text: string) => text.length,
+  }
+  const rest = withoutSettingsKeys(config)
+  assert.deepEqual(Object.keys(rest).sort(), ['countTokens', 'preset', 'prompts'])
+  assert.equal(rest.preset, 'aggressive')
 })
 
 test('M6: parseSettingValue — booleans, numbers, null; `false` is a value, not an error', () => {
@@ -216,149 +342,59 @@ test('M6: describeSettingsChange flags window cache, nudge dedup, and order warn
 })
 
 test('M6: command surface degrades without a service', async () => {
-  const surface = makeSettingsCommandSurface(() => undefined, () => resolveAcpSettings({}))
+  const surface = makeSettingsCommandSurface(() => undefined, () => resolveAcpSettings({}), () => ACP_SETTINGS_NAMESPACE)
   assert.equal(surface.available, false)
   assert.equal(surface.describe(), undefined)
   await assert.rejects(surface.update({ autoNudge: false }), /not available/)
 })
 
-// ── E2E with a real engine + in-memory provider ───────────────────────────
+test('M6: command surface describes and writes BY ENTRY ID', async () => {
+  const writes: { ns: string; kind: string; payload: Record<string, unknown> }[] = []
+  const surface = makeSettingsCommandSurface(
+    () => ({
+      describe: () => [{ ns: 'other-row' }, { ns: 'my-acp-row' }],
+      update: async (ns: string, patch: Record<string, unknown>) => { writes.push({ ns, kind: 'update', payload: patch }) },
+      replace: async (ns: string, section: Record<string, unknown>) => { writes.push({ ns, kind: 'replace', payload: section }) },
+    }) as never,
+    () => resolveAcpSettings({}),
+    () => 'my-acp-row',
+  )
+  assert.equal(surface.available, true)
+  assert.equal(String((surface.describe() as { ns?: unknown } | undefined)?.ns), 'my-acp-row')
+  await surface.update({ autoNudge: false })
+  await surface.replaceSection({ autoNudge: true })
+  assert.deepEqual(writes, [
+    { ns: 'my-acp-row', kind: 'update', payload: { autoNudge: false } },
+    { ns: 'my-acp-row', kind: 'replace', payload: { autoNudge: true } },
+  ])
+})
 
-test('M6: engine env reads LIVE settings — an external edit hot-applies', async () => {
+// ── E2E with a real engine + loader-shaped volatile config ────────────────
+
+test('M6: engine env reads LIVE settings — a volatile commit hot-applies without a remount', async () => {
   const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  // Cordis drops warn-level messages at its default threshold, so capture them
-  // through an explicit-level exporter registered before construction.
-  const logs: Message[] = []
-  const { fiber, engine } = await mountEngine(root, {}, (ctx) => {
-    ctx.logger.exporter({ levels: { default: 3 }, export: (message) => { logs.push(message) } })
-  })
+  const { config, refs } = loaderConfig({})
+  const { fiber, engine } = await mountEngine(root, config)
   try {
     assert.equal(engine.env.modelContextLimit, DEFAULT_CONTEXT_WINDOW)
     assert.equal(engine.env.nudgeMaxContextLimitPct, 0.7)
-    // The capability probe must stay silent on a supported host (issue #173).
-    assert.ok(
-      !logs.some((m) => m.type === 'warn' && String(m.args[0]).includes('installSection')),
-      'no spurious installSection warn on a supported host',
-    )
-    const provider = root.get('settings') as MemorySettingsProvider
-    provider.publishForTest({ [ACP_SETTINGS_NAMESPACE]: { nudgeMaxContextLimitPct: 0.6 } })
-    await flushRounds()
+    // The loader commits a form write in place (Entry.update → updateVolatile):
+    // same engine instance, same ref, new value.
+    commit(refs, 'nudgeMaxContextLimitPct', 0.6)
     assert.equal(engine.env.nudgeMaxContextLimitPct, 0.6)
-  } finally {
-    await fiber.dispose()
-  }
-})
-
-test('M6: /acp-prune config list/set/reset round-trips through a real provider', async () => {
-  const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  const { fiber, engine } = await mountEngine(root)
-  try {
-    const list = await runAcp(engine.env, 'config')
-    assert.match(list, /nudgeMaxContextLimitPct/)
-    assert.match(list, /source/)
-
-    const setResult = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 0.6')
-    assert.match(setResult, /✓/)
-    await flushRounds()
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.6)
-
-    // A boolean key accepts `false` (the parse regression).
-    const boolResult = await runAcp(engine.env, 'config set autoNudge false')
-    assert.match(boolResult, /✓/)
-    await flushRounds()
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.6)
-
-    const resetResult = await runAcp(engine.env, 'config reset nudgeMaxContextLimitPct')
-    assert.match(resetResult, /✓/)
-    await flushRounds()
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.7)
-
-    const unknown = await runAcp(engine.env, 'config set bogus 0.5')
-    assert.match(unknown, /unknown key/)
-    const invalid = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct bogus')
-    assert.match(invalid, /not a valid value/)
-    const outOfRange = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 1.5')
-    assert.match(outOfRange, /rejected/)
-  } finally {
-    await fiber.dispose()
-  }
-})
-
-test('M6: settingsEnabled false is a kill switch — composition values stay, provider ignored', async () => {
-  const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  const { fiber, engine } = await mountEngine(root, { settingsEnabled: false, nudgeMaxContextLimitPct: 0.66 })
-  try {
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.66)
-    assert.equal(engine.env.settingsCommand?.available, false)
-    const provider = root.get('settings') as MemorySettingsProvider
-    provider.publishForTest({ [ACP_SETTINGS_NAMESPACE]: { nudgeMaxContextLimitPct: 0.4 } })
-    await flushRounds()
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.66)
-  } finally {
-    await fiber.dispose()
-  }
-})
-
-test('M6: HMR-style remount of the same namespace does not hit duplicate registration (V1 gate)', async () => {
-  const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  const first = await mountEngine(root)
-  assert.equal(first.engine.env.nudgeMaxContextLimitPct, 0.7)
-  await first.fiber.dispose()
-  // The registration rode the disposed fiber; a fresh engine on the same
-  // root must register the SAME namespace cleanly (the R3/HMR scenario).
-  const second = await mountEngine(root)
-  try {
-    assert.equal(second.engine.env.nudgeMaxContextLimitPct, 0.7)
-  } finally {
-    await second.fiber.dispose()
-  }
-})
-
-// ── Locks for the merge-review findings ───────────────────────────────────
-
-test('M6: installSection registers the FILTERED composition subset as `base`', async () => {
-  const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  const { fiber, engine } = await mountEngine(root, { nudgeMaxContextLimitPct: 0.66 })
-  try {
-    const descriptor = engine.env.settingsCommand?.describe()
-    assert.ok(descriptor !== undefined, 'the settings surface is available')
-    // Registering the RESOLVED snapshot instead would make every untouched key
-    // look composed (`source: base`), so /acp-prune config reset would report a
-    // composition value the operator never wrote.
-    assert.deepEqual(descriptor.base, filterSettingsEntry({ nudgeMaxContextLimitPct: 0.66 }))
-    const list = await runAcp(engine.env, 'config')
-    assert.match(list, /nudgeMaxContextLimitPct[^\n]*base/)
-    assert.match(list, /nudgeEmergencyThresholdPct[^\n]*default/)
-  } finally {
-    await fiber.dispose()
-  }
-})
-
-test('M6: a settings edit reaches kernelConfigFor, not just the env getters', async () => {
-  const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  const { fiber, engine } = await mountEngine(root)
-  try {
-    assert.equal(kernelConfigFor(engine.env).nudge.maxContextLimitPct, 0.7)
-    const provider = root.get('settings') as MemorySettingsProvider
-    provider.publishForTest({ [ACP_SETTINGS_NAMESPACE]: { nudgeMaxContextLimitPct: 0.6 } })
-    await flushRounds()
     assert.equal(kernelConfigFor(engine.env).nudge.maxContextLimitPct, 0.6)
+    commit(refs, 'modelContextLimit', 32000)
+    assert.equal(engine.env.modelContextLimit, 32000)
   } finally {
     await fiber.dispose()
   }
 })
 
-test('M6: a settings-layer autoModelContextLimit false gates the window projection', async () => {
+test('M6: a live commit reaches the window gate, not just the env getters', async () => {
   const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  // Composition keeps auto detection ON — only the settings layer turns it off.
-  const { fiber, engine } = await mountEngine(root)
+  // Composition keeps auto detection ON — only the live config turns it off.
+  const { config, refs } = loaderConfig({})
+  const { fiber, engine } = await mountEngine(root, config)
   try {
     const ctx = new Context()
     ctx.provide('sessionProjections', {
@@ -374,35 +410,120 @@ test('M6: a settings-layer autoModelContextLimit false gates the window projecti
       ctx,
     } as unknown as Agent
     // Reading the COMPOSITION value at the gate would keep consulting the
-    // projection even though the user disabled auto detection.
+    // projection even though the setting is now off.
     assert.equal((await engine.windowFor(agent)).source, 'projection')
-    const provider = root.get('settings') as MemorySettingsProvider
-    provider.publishForTest({ [ACP_SETTINGS_NAMESPACE]: { autoModelContextLimit: false } })
-    await flushRounds()
+    commit(refs, 'autoModelContextLimit', false)
     assert.notEqual((await engine.windowFor(agent)).source, 'projection')
   } finally {
     await fiber.dispose()
   }
 })
 
-test('M6: a detached provider falls back to the composition values', async () => {
+test('M6: /acp-prune config list/set/reset round-trips through the forms service', async () => {
   const root = new Context()
-  const providerFiber = await root.plugin(MemorySettingsProvider)
-  const { fiber, engine } = await mountEngine(root, { nudgeMaxContextLimitPct: 0.66 })
+  const forms = await root.plugin(MemorySettingsForms)
+  const { config, refs } = loaderConfig({})
+  ;(root.get('settings') as MemorySettingsForms).refs = refs
+  const { fiber, engine } = await mountEngine(root, config)
   try {
-    const provider = root.get('settings') as MemorySettingsProvider
-    provider.publishForTest({ [ACP_SETTINGS_NAMESPACE]: { nudgeMaxContextLimitPct: 0.4 } })
-    await flushRounds()
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.4)
-    assert.equal(engine.env.settingsCommand?.available, true)
+    const list = await runAcp(engine.env, 'config')
+    assert.match(list, /nudgeMaxContextLimitPct/)
+    assert.match(list, /source/)
 
-    await providerFiber.dispose()
-    await flushRounds()
+    const setResult = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 0.6')
+    assert.match(setResult, /✓/)
+    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.6)
 
-    // Without a disposer the engine holds the dead thunk: the command would
-    // still report available and the pct would freeze at 0.4.
-    assert.equal(engine.env.settingsCommand?.available, false)
+    // A boolean key accepts `false` (the parse regression).
+    const boolResult = await runAcp(engine.env, 'config set autoNudge false')
+    assert.match(boolResult, /✓/)
+    // `autoNudge` has no env getter (the nudge path reads the live snapshot
+    // directly), so assert it through the command surface's snapshot.
+    assert.equal(engine.env.settingsCommand?.snapshot().autoNudge, false)
+    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.6)
+
+    // Every write went to the ENTRY ID, never to a namespace we invented.
+    assert.deepEqual(
+      (root.get('settings') as MemorySettingsForms).writes.map((write) => write.ns),
+      [ACP_SETTINGS_NAMESPACE, ACP_SETTINGS_NAMESPACE],
+    )
+
+    const resetResult = await runAcp(engine.env, 'config reset nudgeMaxContextLimitPct')
+    assert.match(resetResult, /✓/)
+    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.7)
+
+    const unknown = await runAcp(engine.env, 'config set bogus 0.5')
+    assert.match(unknown, /unknown key/)
+    const invalid = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct bogus')
+    assert.match(invalid, /not a valid value/)
+    const outOfRange = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 1.5')
+    assert.match(outOfRange, /rejected/)
+  } finally {
+    await fiber.dispose()
+    await forms.dispose()
+  }
+})
+
+test('M6: the settings entry id comes from the owning profile entry', async () => {
+  const root = new Context()
+  const forms = await root.plugin(MemorySettingsForms)
+  const service = root.get('settings') as MemorySettingsForms
+  // The host files a form per entry id; ours must be picked out of the list.
+  service.namespaces = ['some-other-row', 'my-acp-row']
+  const { config, refs } = loaderConfig({})
+  service.refs = refs
+  const { fiber, engine } = await mountEngine(root, config, (ctx) => {
+    Object.assign(ctx.fiber as object, { entry: { options: { id: 'my-acp-row' } } })
+  })
+  try {
+    const setResult = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 0.6')
+    assert.match(setResult, /✓/)
+    assert.deepEqual(service.writes.map((write) => write.ns), ['my-acp-row'])
+  } finally {
+    await fiber.dispose()
+    await forms.dispose()
+  }
+})
+
+test('M6: settingsEnabled false is a kill switch — composition values stay, service ignored', async () => {
+  const root = new Context()
+  const forms = await root.plugin(MemorySettingsForms)
+  const { config } = loaderConfig({ nudgeMaxContextLimitPct: 0.66 })
+  ;(root.get('settings') as MemorySettingsForms).refs = loaderConfig({}).refs
+  const { fiber, engine } = await mountEngine(root, { ...config, settingsEnabled: false })
+  try {
     assert.equal(engine.env.nudgeMaxContextLimitPct, 0.66)
+    assert.equal(engine.env.settingsCommand?.available, false)
+    const setResult = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 0.5')
+    assert.match(setResult, /no settings provider/)
+    assert.equal((root.get('settings') as MemorySettingsForms).writes.length, 0)
+  } finally {
+    await fiber.dispose()
+    await forms.dispose()
+  }
+})
+
+test('M6: a detached settings service is dropped, the live values keep working', async () => {
+  const root = new Context()
+  const forms = await root.plugin(MemorySettingsForms)
+  const { config, refs } = loaderConfig({ nudgeMaxContextLimitPct: 0.66 })
+  ;(root.get('settings') as MemorySettingsForms).refs = refs
+  const { fiber, engine } = await mountEngine(root, config)
+  try {
+    assert.equal(engine.env.settingsCommand?.available, true)
+    const setResult = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 0.4')
+    assert.match(setResult, /✓/)
+    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.4)
+
+    await forms.dispose()
+
+    // Without the disposer the engine would hold a dead handle: /acp-prune
+    // config would still report available and write into a disposed service.
+    assert.equal(engine.env.settingsCommand?.available, false)
+    // The six knobs are the entry config itself, so they keep reading live.
+    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.4)
+    commit(refs, 'nudgeMaxContextLimitPct', 0.5)
+    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.5)
   } finally {
     await fiber.dispose()
   }
@@ -410,125 +531,77 @@ test('M6: a detached provider falls back to the composition values', async () =>
 
 test('M6: reset keeps keys the six-key schema does not know (no silent data loss)', async () => {
   const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  const { fiber, engine } = await mountEngine(root)
+  const forms = await root.plugin(MemorySettingsForms)
+  const { config, refs } = loaderConfig({})
+  const service = root.get('settings') as MemorySettingsForms
+  service.refs = refs
+  service.user = { nudgeMaxContextLimitPct: 0.6, handWritten: 'keep-me' }
+  commit(refs, 'nudgeMaxContextLimitPct', 0.6)
+  const { fiber, engine } = await mountEngine(root, config)
   try {
-    const provider = root.get('settings') as MemorySettingsProvider
-    provider.publishForTest({
-      [ACP_SETTINGS_NAMESPACE]: { nudgeMaxContextLimitPct: 0.6, handWritten: 'keep-me' },
-    })
-    await flushRounds()
-
     const reset = await runAcp(engine.env, 'config reset nudgeMaxContextLimitPct')
     assert.match(reset, /✓/)
-    await flushRounds()
-
-    // The settings layer does not whitelist keys, so rebuilding the section
-    // from SETTING_KEYS alone would delete the operator's own entry.
-    const user = engine.env.settingsCommand?.describe()?.user
+    // `replace()` merges the section over `base`, so a section rebuilt from
+    // SETTING_KEYS alone would silently revert the operator's other overrides.
+    const user = engine.env.settingsCommand?.describe()?.user as Record<string, unknown> | undefined
     assert.equal(user?.handWritten, 'keep-me')
     assert.equal(user?.nudgeMaxContextLimitPct, undefined)
     assert.equal(engine.env.nudgeMaxContextLimitPct, 0.7)
   } finally {
     await fiber.dispose()
+    await forms.dispose()
   }
 })
 
-// ── Issue #173: host settings service without installSection (dsh-settings >= 0.1.7) ───────────────────
-
-test('M6: a settings service WITHOUT installSection degrades gracefully (issue #173)', async () => {
-  const root = new Context()
-  await root.plugin(FormsLikeSettingsService)
-  const forms = root.get('settings') as FormsLikeSettingsService
-  assert.ok(!('installSection' in forms), 'fixture mirrors 0.1.7: no installSection method')
-  // Pre-fix, construction threw `TypeError: ...installSection is not a function`
-  // here and the host logged it as a startup error (dist/index.js stack in #173).
-  const logs: Message[] = []
-  const { fiber, engine } = await mountEngine(root, { nudgeMaxContextLimitPct: 0.66 }, (ctx) => {
-    ctx.logger.exporter({ levels: { default: 3 }, export: (message) => { logs.push(message) } })
-  })
-  try {
-    // No registration happened → the command surface reports unavailable and
-    // the knobs keep their composition values (readSettingsSource untouched).
-    assert.equal(engine.env.settingsCommand?.available, false)
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.66)
-    // One warn explains the degradation; nothing logs an ERROR for what is a
-    // supported out-of-range host line, not a broken integration.
-    const warns = logs.filter((m) => m.type === 'warn' && String(m.args[0]).includes('installSection'))
-    assert.equal(warns.length, 1, 'exactly one warn names the missing capability')
-    assert.ok(!logs.some((m) => m.type === 'error'), 'no error-level log for a degraded optional section')
-    // /acp-prune config stays usable: list shows the composition values with
-    // no registered layers, and writes degrade to guidance instead of hitting
-    // the foreign service API (whose updates would throw entry-id errors).
-    const list = await runAcp(engine.env, 'config')
-    assert.match(list, /nudgeMaxContextLimitPct\s+0\.66\s+default/)
-    const setResult = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 0.5')
-    assert.match(setResult, /no settings provider/)
-  } finally {
-    await fiber.dispose()
-  }
-})
-
-
-// ── Issue #176: a composed preset must reach the settings layer too ─────────
+// ── Issue #176: a composed preset must reach the live reads ────────────────
 // Every kernel consumer reads the six scalar keys through the live settings
 // source, never through `this.config` — so the preset has to be present in the
-// base layer and the seeded snapshot, or it silently never fires.
+// live snapshot, or it silently never fires.
 
-test('M6: a composed preset seeds the base layer AND the live reads (issue #176)', async () => {
+test('M6: a composed preset seeds the live reads (issue #176)', async () => {
   const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  const { fiber, engine } = await mountEngine(root, { preset: 'aggressive' })
+  const { config } = loaderConfig({}, { preset: 'aggressive' })
+  const { fiber, engine } = await mountEngine(root, config)
   try {
-    // Exactly the three preset-filled threshold keys — not the full resolved
-    // snapshot (that would over-attribute untouched keys as composed) and not
-    // the empty raw-row subset (the bug: schema defaults won over the preset).
-    assert.deepEqual(engine.env.settingsCommand?.describe()?.base, {
-      nudgeMinContextLimitPct: 0.3,
-      nudgeMaxContextLimitPct: 0.5,
-      nudgeEmergencyThresholdPct: 0.7,
-    })
-    // And every kernel-facing read sees them — env getters and kernelConfigFor.
+    // Exactly the three preset-filled thresholds, resolved on the live path.
     assert.equal(engine.env.nudgeMinContextLimitPct, 0.3)
     assert.equal(engine.env.nudgeMaxContextLimitPct, 0.5)
     assert.equal(engine.env.nudgeEmergencyThresholdPct, 0.7)
     assert.equal(kernelConfigFor(engine.env).nudge.maxContextLimitPct, 0.5)
-    // A runtime override still wins over the composed preset...
-    const provider = root.get('settings') as MemorySettingsProvider
-    provider.publishForTest({ [ACP_SETTINGS_NAMESPACE]: { nudgeMaxContextLimitPct: 0.55 } })
-    await flushRounds()
+  } finally {
+    await fiber.dispose()
+  }
+})
+
+test('M6: an explicit row value outranks the preset, which outranks the default', async () => {
+  const root = new Context()
+  // nudgeMax is spelled on the row; the other two come from the preset.
+  const { config, refs } = loaderConfig({ nudgeMaxContextLimitPct: 0.55 }, { preset: 'aggressive' })
+  const { fiber, engine } = await mountEngine(root, config)
+  try {
     assert.equal(engine.env.nudgeMaxContextLimitPct, 0.55)
-    // ...and the other two keys stay at their preset values.
     assert.equal(engine.env.nudgeMinContextLimitPct, 0.3)
     assert.equal(engine.env.nudgeEmergencyThresholdPct, 0.7)
+    // A live override still beats both.
+    commit(refs, 'nudgeMaxContextLimitPct', 0.6)
+    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.6)
+    assert.equal(engine.env.nudgeMinContextLimitPct, 0.3)
   } finally {
     await fiber.dispose()
   }
 })
 
-test('M6: /acp-prune config attributes a preset-filled key to `base`, reset returns to the preset (issue #176)', async () => {
+test('M6: remounting the engine on the same root stays clean (no registration to collide)', async () => {
   const root = new Context()
-  await root.plugin(MemorySettingsProvider)
-  const { fiber, engine } = await mountEngine(root, { preset: 'aggressive' })
+  const forms = await root.plugin(MemorySettingsForms)
+  const first = await mountEngine(root, loaderConfig({}).config)
+  assert.equal(first.engine.env.nudgeMaxContextLimitPct, 0.7)
+  await first.fiber.dispose()
+  const second = await mountEngine(root, loaderConfig({ nudgeMaxContextLimitPct: 0.66 }).config)
   try {
-    const list = await runAcp(engine.env, 'config')
-    assert.match(list, /nudgeMaxContextLimitPct[^\n]*base/)
-    // A key the composition did NOT preset still attributes to the default...
-    assert.match(list, /autoNudge[^\n]*default/)
-
-    const setResult = await runAcp(engine.env, 'config set nudgeMaxContextLimitPct 0.55')
-    assert.match(setResult, /✓/)
-    await flushRounds()
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.55)
-
-    // Resetting drops back to the COMPOSED preset value, not the engine default
-    // (a runtime reset restores what the composition chose).
-    const resetResult = await runAcp(engine.env, 'config reset nudgeMaxContextLimitPct')
-    assert.match(resetResult, /composition value 0\.5/)
-    await flushRounds()
-    assert.equal(engine.env.nudgeMaxContextLimitPct, 0.5)
+    assert.equal(second.engine.env.nudgeMaxContextLimitPct, 0.66)
   } finally {
-    await fiber.dispose()
+    await second.fiber.dispose()
+    await forms.dispose()
   }
 })
-

@@ -182,12 +182,15 @@ const cachePrefixChecks = (result) => {
   const schemas = new Set(requests.map((request) => JSON.stringify(request.body.tools ?? null)))
   list.push(['wire: tools array byte-stable across requests', schemas.size === 1, `${schemas.size} distinct schema(s)`])
 
-  // The leading message is the largest cacheable prefix. Compare from the second request
-  // on: the engine injects its one-time ACP guidance section during the first turn's
-  // pre-step, so request 1 may legitimately precede that injection.
-  const leading = requests.slice(1).map((request) => JSON.stringify(outboundMessagesOf(request)[0] ?? null))
+  // The cacheable head of a Messages request is the TOP-LEVEL `system` field, not
+  // messages[0]: the harness sends the system prompt out of band, and the first
+  // conversation message legitimately moves when a compaction replaces the head of
+  // the surface. Compare from the second request on: the engine injects its one-time
+  // ACP guidance section during the first turn's pre-step, so request 1 may
+  // legitimately precede that injection.
+  const leading = requests.slice(1).map((request) => JSON.stringify(request.body.system ?? null))
   const leadingDistinct = new Set(leading).size
-  list.push(['wire: leading message byte-stable after request 1', leadingDistinct === 1, `${leadingDistinct} distinct`])
+  list.push(['wire: system field byte-stable after request 1', leadingDistinct === 1, `${leadingDistinct} distinct`])
 
   // A scenario with no compaction is append-only by construction, so the previous
   // request's message list must be a byte-identical prefix of the next one — any

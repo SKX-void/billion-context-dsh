@@ -1,5 +1,10 @@
 import { createServer } from 'node:http'
 const state = { turns: [], index: 0, seqs: {}, requests: [] }
+// Anthropic-Messages-style SSE: EVERY `data:` payload is a JSON object carrying
+// a string `type` — dsh-llm-deepseek's parser (`src/sse.ts`) throws
+// `MALFORMED_RESPONSE` on anything else, and the translator
+// (`src/translate.ts`) walks message_start → content_block_* → message_delta →
+// message_stop, so this is the whole protocol surface the harness needs.
 const sseEvent = (payload) => {
   return 'data: ' + JSON.stringify(payload) + '\n\n'
 }
@@ -27,6 +32,12 @@ const listen = async (server, port) => {
   })
   return await p
 }
+// Honest usage for rule 12's projection anchor: the input side is priced off the
+// request body the provider actually received, the output side off the scripted
+// text — never a constant.
+const inputTokensOf = (parsed) => {
+  return Math.ceil(JSON.stringify(parsed.messages ?? []).length / 4) + Math.ceil(JSON.stringify(parsed.tools ?? []).length / 4)
+}
 const handler = (req, res) => {
   const chunks = []
   req.on('data', (c) => chunks.push(c))
@@ -42,11 +53,14 @@ const handler = (req, res) => {
     return
   }
   if (turn.kind === 'text') {
+    const outputTokens = Math.max(1, Math.ceil(Array.from(turn.text).length / 4))
     openSse(res)
-    writeSse(res, { choices: [{ index: 0, delta: { content: turn.text }, finish_reason: null }] })
-    const usage = { prompt_tokens: Math.ceil(JSON.stringify(parsed.messages ?? []).length / 4) + Math.ceil(JSON.stringify(parsed.tools ?? []).length / 4), completion_tokens: Math.max(1, Math.ceil(Array.from(turn.text).length / 4)) }
-  writeSse(res, { choices: [{ index: 0, delta: { content: '' }, finish_reason: 'stop' }], usage })
-    writeDone(res)
+    writeSse(res, { type: 'message_start', message: { usage: { input_tokens: inputTokensOf(parsed), output_tokens: 0 } } })
+    writeSse(res, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+    writeSse(res, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: turn.text } })
+    writeSse(res, { type: 'content_block_stop', index: 0 })
+    writeSse(res, { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: outputTokens } })
+    writeSse(res, { type: 'message_stop' })
     res.end()
     state.requests.push({ kind: 'text', raw: body, body: parsed })
     return
@@ -54,11 +68,17 @@ const handler = (req, res) => {
   if (turn.kind === 'tool') {
   const args = render(turn.argsTemplate, state.seqs)
   const callId = 'mock-call-' + state.index
+  // The tool input arrives as JSON fragments (input_json_delta), the way a real
+  // provider streams it: the translator reassembles `block.json` at block stop.
+  const half = Math.max(1, Math.floor(args.length / 2))
   openSse(res)
-  writeSse(res, { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: callId, type: 'function', function: { name: turn.name, arguments: args.slice(0, Math.max(1, Math.floor(args.length / 2))) } }] }, finish_reason: null }] })
-  writeSse(res, { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: args.slice(Math.max(1, Math.floor(args.length / 2))) } }] }, finish_reason: null }] })
-  writeSse(res, { choices: [{ index: 0, delta: { content: '' }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: Math.ceil(JSON.stringify(parsed.messages ?? []).length / 4) + Math.ceil(JSON.stringify(parsed.tools ?? []).length / 4), completion_tokens: 2 } })
-  writeDone(res)
+  writeSse(res, { type: 'message_start', message: { usage: { input_tokens: inputTokensOf(parsed), output_tokens: 0 } } })
+  writeSse(res, { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: callId, name: turn.name, input: {} } })
+  writeSse(res, { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: args.slice(0, half) } })
+  writeSse(res, { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: args.slice(half) } })
+  writeSse(res, { type: 'content_block_stop', index: 0 })
+  writeSse(res, { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 2 } })
+  writeSse(res, { type: 'message_stop' })
   res.end()
   state.requests.push({ kind: 'tool', name: turn.name, raw: body, body: parsed })
   return
@@ -79,6 +99,9 @@ const handler = (req, res) => {
   state.requests.push({ kind: 'error', status: turn.status ?? 400, raw: body, body: parsed })
   return
   }
+  res.writeHead(500, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ error: { message: `unknown turn kind ${String(turn.kind)}`, type: 'MOCK_SCRIPT', code: 'script' } }))
+  state.requests.push({ type: 'error', path: req.url })
 })
 }
 const openSse = (res) => {
@@ -91,9 +114,6 @@ const openSse = (res) => {
 }
 const writeSse = (res, payload) => {
   res.write(sseEvent(payload))
-}
-const writeDone = (res) => {
-  res.write('data: [DONE]\n\n')
 }
 // Unknown placeholders throw instead of degrading to a literal: a scenario
 // typo ({{U9}}) must fail the suite on the spot, not surface later as a
